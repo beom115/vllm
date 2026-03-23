@@ -57,6 +57,7 @@ def main(
     isa: str | None = None,
     seed: int = 0,
     iters: int = 20,
+    block_layout: str = "random",
 ) -> None:
     set_random_seed(seed)
     num_seqs = len(seq_lens)
@@ -87,6 +88,25 @@ def main(
         head_size,
     )
 
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+
+    if block_layout == "sequential":
+        # Each sequence gets contiguous block IDs: seq i → [i*M, i*M+1, ..., i*M+M-1]
+        required_blocks = num_seqs * max_num_blocks_per_seq
+        num_blocks = max(num_blocks, required_blocks)
+        block_tables = torch.arange(
+            num_seqs * max_num_blocks_per_seq, dtype=torch.int32
+        ).view(num_seqs, max_num_blocks_per_seq)
+    else:
+        block_tables = torch.randint(
+            0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+        )
+
+    # Reallocate KV cache tensors if num_blocks was adjusted for sequential layout
     key_value = tensor_cache(
         elem_num=2 * num_blocks * num_kv_heads * block_size * head_size,
         dtype=dtype,
@@ -99,21 +119,10 @@ def main(
         head_size,
     )
     key_cache, value_cache = key_value.unbind(0)
-
-    # KV cache for CPU attention
     packed_key_cache = torch.empty(
         num_blocks, num_kv_heads, block_size, head_size, dtype=dtype
     )
     packed_value_cache = torch.empty_like(packed_key_cache)
-
-    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
-        dim=0, dtype=torch.int32
-    )
-    kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
-    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    block_tables = torch.randint(
-        0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
-    )
 
     # use reshape_and_cache to pack key_cache and value_cache
     slot_mapping = torch.arange(0, num_blocks * block_size, dtype=torch.int64)
@@ -239,6 +248,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--block-layout",
+        type=str,
+        choices=["random", "sequential", "both"],
+        default="random",
+        help="Block table layout: random (scattered), sequential (contiguous per seq), "
+        "or both (run both and compare)",
+    )
 
     args = parser.parse_args()
     print(args)
@@ -254,7 +271,7 @@ if __name__ == "__main__":
 
     print("batch (query len, kv len) = ", seq_lens)
 
-    main(
+    common_kwargs = dict(
         seq_lens=seq_lens,
         num_heads=(args.num_query_heads, args.num_kv_heads),
         head_size=args.head_size,
@@ -270,3 +287,8 @@ if __name__ == "__main__":
         seed=args.seed,
         iters=args.iters,
     )
+
+    layouts = ["random", "sequential"] if args.block_layout == "both" else [args.block_layout]
+    for layout in layouts:
+        print(f"\n=== block_layout: {layout} ===")
+        main(**common_kwargs, block_layout=layout)
