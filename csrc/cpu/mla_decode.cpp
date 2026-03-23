@@ -54,6 +54,15 @@ struct KernelVecType<c10::BFloat16> {
   using qk_vec_type = vec_op::FP32Vec16;
   using v_load_vec_type = vec_op::BF16Vec16;
 };
+
+#else
+// Fallback for x86 without AVX512BF16 (e.g. Cascade Lake, Skylake)
+template <>
+struct KernelVecType<c10::BFloat16> {
+  using qk_load_vec_type = vec_op::BF16Vec16;
+  using qk_vec_type = vec_op::FP32Vec16;
+  using v_load_vec_type = vec_op::BF16Vec16;
+};
 #endif
 
 template <int HEAD_DIM, int V_HEAD_DIM, int BLOCK_SIZE, int HEAD_UNROLL,
