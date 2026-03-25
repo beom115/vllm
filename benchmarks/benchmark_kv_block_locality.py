@@ -226,7 +226,7 @@ def main(args) -> None:
         run_results: dict[str, float] = {}
 
         # 각 모드 측정 전 동일한 파편화 baseline으로 리셋
-        for mode in ("sequential", "random"):
+        for mode in ("random", "sequential"):
             _fragment_free_list(llm, args.frag_requests)
             tps = _run_one(llm, prompts, sampling_params, mode)
             results[mode].append(tps)
