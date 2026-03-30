@@ -36,6 +36,37 @@ def _get_free_block_queue(llm):
             .scheduler.kv_cache_manager.block_pool.free_block_queue)
 
 
+def _print_block_info(llm):
+    import torch
+    scheduler = llm.llm_engine.engine_core.engine_core.scheduler
+    coordinator = scheduler.kv_cache_manager.coordinator
+    kv_cache_config = coordinator.kv_cache_config
+    spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    num_blocks = coordinator.block_pool.num_gpu_blocks
+    # layer_names: 이 그룹에 속한 attention 레이어 이름 목록
+    num_layers = sum(len(g.layer_names) for g in kv_cache_config.kv_cache_groups)
+
+    dtype_bytes = torch.tensor([], dtype=spec.dtype).element_size()
+    dtype_str = str(spec.dtype).replace("torch.", "")
+    bytes_per_layer = spec.page_size_bytes          # 레이어 1개당 블록 크기
+    bytes_per_block = bytes_per_layer * num_layers  # 논리 블록 1개의 실제 총 크기
+
+    print(f"\n[KV Cache Info]")
+    print(f"  block_size         : {spec.block_size} tokens")
+    print(f"  num_kv_heads       : {spec.num_kv_heads}")
+    print(f"  head_size          : {spec.head_size}")
+    print(f"  dtype              : {dtype_str} ({dtype_bytes}B/elem)")
+    print(f"  num_layers         : {num_layers}")
+    print(f"  bytes/block/layer  : {bytes_per_layer / 1024:.1f} KB  "
+          f"(= {spec.block_size}tok × {spec.num_kv_heads}heads "
+          f"× {spec.head_size}dim × 2(K+V) × {dtype_bytes}B/{dtype_str})")
+    print(f"  bytes/block (total): {bytes_per_block / 1024:.1f} KB  "
+          f"(= {bytes_per_layer/1024:.1f} KB × {num_layers} layers)")
+    print(f"  num_blocks         : {num_blocks:,}")
+    print(f"  total KV mem       : {bytes_per_block * num_blocks / 1024**3:.2f} GiB")
+    print()
+
+
 def _restitch_queue(queue, blocks):
     if not blocks:
         queue.fake_free_list_head.next_free_block = queue.fake_free_list_tail
@@ -75,6 +106,20 @@ def _fragment(llm, n):
     llm.generate(["Hello"] * n, sampling_params=params)
 
 
+def _frag_score(llm) -> float:
+    """단편화 정도를 [0, 1]로 반환한다.
+
+    free list의 인접 블록 ID 쌍 중 비연속적인(|id[i+1] - id[i]| != 1) 비율.
+    0 = 완전 순차, 1 = 완전 무작위.
+    """
+    blocks = _get_free_block_queue(llm).get_all_free_blocks()
+    if len(blocks) < 2:
+        return 0.0
+    ids = [b.block_id for b in blocks]
+    non_sequential = sum(1 for a, b in zip(ids, ids[1:]) if abs(b - a) != 1)
+    return non_sequential / (len(ids) - 1)
+
+
 def _run_one(llm, prompts, sp, mode):
     q = _get_free_block_queue(llm)
     orig = _install_patch(q, mode)
@@ -106,8 +151,10 @@ def run_sweep(llm, prompt_counts, output_len, frag_requests,
 
         seq_vals, rnd_vals = [], []
         for r in range(num_runs):
+            frag_scores = []
             for mode in ("sequential", "random"):
                 _fragment(llm, frag_requests)
+                frag_scores.append(_frag_score(llm))
                 tps = _run_one(llm, prompts, sp, mode)
                 if mode == "sequential":
                     seq_vals.append(tps)
@@ -115,8 +162,10 @@ def run_sweep(llm, prompt_counts, output_len, frag_requests,
                     rnd_vals.append(tps)
 
             sp_ratio = seq_vals[-1] / rnd_vals[-1]
+            frag_str = " ".join(f"{s:.3f}" for s in frag_scores)
             print(f"    run {r+1}: seq={seq_vals[-1]:>7,.0f} "
-                  f"rnd={rnd_vals[-1]:>7,.0f}  speedup={sp_ratio:.4f}x")
+                  f"rnd={rnd_vals[-1]:>7,.0f}  speedup={sp_ratio:.4f}x"
+                  f"  frag=[{frag_str}]")
 
         seq_mean = statistics.mean(seq_vals)
         rnd_mean = statistics.mean(rnd_vals)
@@ -151,7 +200,9 @@ def main(args):
         max_model_len=args.max_model_len,
         enable_prefix_caching=False,
     )
-    print("로딩 완료. 실험 시작...\n")
+    print("로딩 완료.")
+    _print_block_info(llm)
+    print("실험 시작...\n")
 
     results = run_sweep(
         llm,
